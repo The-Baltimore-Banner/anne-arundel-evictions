@@ -1,0 +1,877 @@
+---
+title: "fact-check"
+format: html
+editor: visual
+---
+
+```{r}
+library(tidyverse)
+library(readr)
+library(janitor)
+library(lubridate)
+library(tidycensus)
+library(readxl)
+library(corrr)
+library(sqldf)
+library(fuzzyjoin)
+library(stringdist)
+library(sf)
+library(mapview)
+library(scales)
+#census_api_key("549950d36c22ff16455fe196bbbd01d63cfbe6cf", install = TRUE)
+options(digits=3)
+options(scipen=999)
+'%notin%' <- Negate('%in%')
+#does a standard group_by and count() with percentage
+grouper <- function(input_df, group_by_column, new_column_name = "n()"){
+  output_df <- input_df %>%
+    group_by(.data[[group_by_column]]) %>%
+    summarise(temp_count = n()) %>%
+    mutate(percent = temp_count/sum(temp_count)*100) %>%
+    arrange(desc(percent)) %>%
+    rename(!!new_column_name := temp_count)
+  return(output_df)
+}
+#group/counts every column in input dataframe
+group_count <- function(input_df, group_column_name='n()', state_filter=NA, start_col = 1){
+  column_names <- colnames(input_df)
+  if(!is.na(state_filter)){
+    input_df <- input_df %>%
+      filter(state == state_filter)
+  }
+  for (column in column_names[start_col:length(column_names)]){
+    output <- grouper(input_df, column, group_column_name)
+    print(output)
+  }
+}
+#function for calculating age, updates to the day; stolen from the internet
+calc_age <- function(birthDate, refDate = Sys.Date()) {
+    require(lubridate)
+    period <- as.period(interval(birthDate, refDate),
+                        unit = "year")
+    period$year
+}
+#tolowers case of every character column in a dataframe
+tolower_df <- function(input_df){
+  names <- colnames(input_df)
+  output_df <- input_df
+  names <- colnames(output_df)
+  for (name in names){
+    if (is.character(output_df[[name]])){
+      output_df[[name]] <- totolower(output_df[[name]])
+      #print('yes')
+    } else {
+      output_df[[name]] <- output_df[[name]]
+      #print('no')
+    }
+  }
+  return(output_df)
+}
+#imports every file in a folder
+import_files_in_folder <- function(input_path, output_name=''){
+  files <- list.files(path=input_path)
+  for (file in files){
+    print(file)
+    file_path = paste0(input_path, file)
+    file_sans_csv = str_remove(file, '.csv')
+    file_sans_csv = gsub("-", "_", file_sans_csv)
+    imported_file <- read_csv(file_path) %>%
+      clean_names()
+    assign(paste0(file_sans_csv, output_name), imported_file, envir = parent.frame())
+  }
+}
+import_bind_files_in_folder <- function(input_path, output_name=''){
+  files <- list.files(path=input_path)
+  master <- read_csv(paste0(input_path, files[1]))
+  for (file in files[2:length(files)]){
+    if (str_sub(file, -3) == 'csv'){
+      binder <- read_csv(paste0(input_path, file))
+      master <- master %>%
+        bind_rows(binder)
+    } else {
+      #pass
+    }
+  }
+  return(master)
+}
+grouper_sum <- function(input_df, group_by_column, sum_column, new_column_name = "n()"){
+  output_df <- input_df %>%
+    group_by(.data[[group_by_column]]) %>%
+    summarise(temp_count = sum(.data[[sum_column]])) %>%
+    mutate(percent = temp_count/sum(temp_count)*100) %>%
+    arrange(desc(percent)) %>%
+    rename(!!new_column_name := temp_count)
+  return(output_df)
+}
+
+#lowers case of every character column in a dataframe
+lower_df <- function(input_df){
+  names <- colnames(input_df)
+  output_df <- input_df
+  names <- colnames(output_df)
+  for (name in names){
+    if (is.character(output_df[[name]])){
+      output_df[[name]] <- tolower(output_df[[name]])
+      #print('yes')
+    } else {
+      output_df[[name]] <- output_df[[name]]
+      #print('no')
+    }
+  }
+  return(output_df)
+}
+
+```
+
+# DATABASE BUILDING
+
+## IMPORT
+
+```{r}
+
+#importing addresses with counts of eviction filings by month and year
+# see methodology for how this was created
+#
+filings <- read_csv("data/output/rooftop-eviction-cases.csv") %>%
+  st_as_sf(coords = c("lng", "lat"),
+           crs = 4326)
+
+parcels <- read_sf("data/shapes/Parcels.geojson") %>%
+  #cleaning up text
+  clean_names() %>%
+  lower_df() %>%
+  #filtering for multifamily
+  mutate(asst_no_dwell_units = as.numeric(asst_no_dwell_units)) %>%
+  #repairing errors in shapes
+  st_make_valid() %>%
+  #filtering for multifamily
+  filter(asst_use_code == "m ") %>%
+  #combining multiple parcels with the same name
+  group_by(asst_first_owner) %>%
+  summarise(geometry = st_union(geometry),
+            puids = paste0(unique(puid), collapse = ", "),
+            dwelling_units = sum(asst_no_dwell_units),
+            development_names = paste0(unique(asst_prop_develop), collapse = ", "),
+            madr_line_1 = paste0(unique(madr_line_1), collapse = ", "),
+            madr_line_2 = paste0(unique(madr_line_2), collapse = ", "),
+            madr_line_3 = paste0(unique(madr_line_3), collapse = ", "),
+            ) %>%
+  mutate(parcel_area = st_area(geometry))
+
+#reading tracts for anne arundel
+tracts <- read_sf("data/shapes/anne-arundel-census-tracts.geojson") %>%
+  tigris::erase_water(area_threshold = .9) %>%
+  clean_names() %>%
+  select(geoid20) %>%
+  mutate(tract_area = st_area(geometry))
+
+```
+
+## JOINS AND INTERSECTIONS
+
+```{r}
+
+#intersecting tracts with parcels
+parcels_by_tract <- st_intersection(parcels, tracts) %>%
+  mutate(intersection_area = st_area(geometry)) %>%
+  mutate(percent_parcel_in_tract = as.numeric(intersection_area/parcel_area))
+
+#making a simple version for future joins
+simple_parcels_by_tracts <- parcels_by_tract %>%
+  select(asst_first_owner, geometry) %>%
+  group_by(asst_first_owner) %>%
+  summarise(geometry = st_union(geometry)) %>%
+  clean_names()
+  
+
+#this code performs the geographical join between evictions and parcels and tracts, it takes forever. run at your own risk
+#filings_by_parcel <- st_intersection(parcels, filings)
+#write_sf(filings_by_parcel, "data/output/filings-by-parcel-with-defendants.geojson")
+
+#filings_by_parcel_by_tract <- st_intersection(parcels_by_tract, filings)
+#write_sf(filings_by_parcel_by_tract, "data/output/filings-by-parcel-by-tract.geojson")
+
+filings_by_parcel <- read_sf("data/output/filings-by-parcel-with-defendants.geojson")
+
+filings_by_parcel_by_tract <- read_sf("data/output/filings-by-parcel-by-tract.geojson") %>%
+  mutate(cases = percent_parcel_in_tract * cases,
+         dwelling_units = percent_parcel_in_tract * dwelling_units)
+
+```
+
+## BUILD PARCELS BY FILINGS
+
+```{r}
+
+df_parcels_by_filings <- filings_by_parcel %>% 
+  group_by(year, asst_first_owner, dwelling_units, parcel_area, madr_line_1) %>%
+  summarise(cases = sum(cases)) %>%
+  st_drop_geometry() %>%
+  pivot_wider(values_from = cases, names_from = year) %>%
+  clean_names() 
+
+df_parcels_by_filings[is.na(df_parcels_by_filings)] <- 0
+
+df_parcels_by_filings <- df_parcels_by_filings %>%
+  mutate(xtotal = x2019 + x2020 + x2021 + x2022 +x2023) %>%
+  mutate(across(starts_with("x"), ~ . / dwelling_units, .names = "evictions_per_unit_{col}")) %>%
+  filter(dwelling_units > 10)
+
+sf_parcels_by_filings <- parcels %>%
+  mutate(parcel_area = as.numeric(parcel_area)) %>%
+  left_join(df_parcels_by_filings)
+
+highlighted_for_viz <- sf_parcels_by_filings %>%
+          filter(str_detect(madr_line_1, "c/o hend"))
+
+the_forest <- c("24003730403", "24003730508", "24003730511", "24003730514", "24003730512")
+
+the_forest_tracts <- tracts %>%
+  filter(geoid20 %in% the_forest)
+
+```
+
+## FILINGS BY UNIT BY PARCEL
+
+```{r}
+
+filings_by_parcel_over_time <- filings_by_parcel %>%
+  st_drop_geometry() %>%
+  arrange(year, month) %>%
+  group_by(asst_first_owner, madr_line_1, madr_line_2, madr_line_3, dwelling_units, year, month) %>%
+  summarise(cases = sum(cases)) %>%
+  mutate(viz_date = mdy(paste0(month, "/1/", year)))
+
+all_filings_by_parcel_over_time <- filings_by_parcel_over_time %>%
+  ungroup() %>%
+  select(asst_first_owner, dwelling_units, viz_date, dwelling_units, cases) %>%
+  group_by(asst_first_owner, dwelling_units, viz_date) %>%
+  summarise(cases = sum(cases)) %>%
+  mutate(cases_per_100_units = (cases/dwelling_units)*100) %>%
+  arrange(asst_first_owner, viz_date) 
+
+webb_filings_by_parcel_over_time <- filings_by_parcel_over_time %>%
+  filter(str_detect(madr_line_1, "webb")) %>%
+  ungroup() %>%
+  select(asst_first_owner, dwelling_units, viz_date, dwelling_units, cases) %>%
+  group_by(asst_first_owner, dwelling_units, viz_date) %>%
+  summarise(cases = sum(cases)) %>%
+  mutate(cases_per_100_units = (cases/dwelling_units)*100) %>%
+  arrange(asst_first_owner, viz_date) 
+
+all_parcels_filings_by_parcel_over_time <- filings_by_parcel_over_time %>%
+  group_by(viz_date) %>%
+  summarise(dwelling_units = sum(dwelling_units),
+            cases = sum(cases)) %>%
+  mutate(cases_per_100_units = (cases/dwelling_units)*100) %>%
+  mutate(asst_first_owner = "all parcels") %>%
+  arrange(asst_first_owner, viz_date)
+
+all_other_parcels_filings_by_parcel_over_time <- filings_by_parcel_over_time %>%
+  filter(!str_detect(madr_line_1, "webb")) %>%
+  group_by(viz_date) %>%
+  summarise(dwelling_units = sum(dwelling_units),
+            cases = sum(cases)) %>%
+  mutate(cases_per_100_units = (cases/dwelling_units)*100) %>%
+  mutate(asst_first_owner = "all other parcels") %>%
+  arrange(asst_first_owner, viz_date)
+
+webb_and_all_parcels_filings_by_parcel_over_time <- webb_filings_by_parcel_over_time %>%
+  bind_rows(all_parcels_filings_by_parcel_over_time) %>%
+  bind_rows(all_other_parcels_filings_by_parcel_over_time) %>%
+  arrange(asst_first_owner, viz_date) %>%
+  rename(parcel = asst_first_owner)
+
+
+ggplot(data = webb_and_all_parcels_filings_by_parcel_over_time) +
+  geom_line(aes(x = viz_date, y = cases_per_100_units, color = parcel)) +
+  theme_minimal() +
+  labs(title = "The Forest parcels versus all parcels",
+       x = "Month",
+       y = "FTPR filings per 100 units") +
+  scale_color_discrete(name = "Parcel")
+
+```
+## FILINGS BY TRACT
+
+```{r}
+
+filings_by_tract <- filings_by_parcel_by_tract %>% 
+  group_by(geoid20) %>%
+  summarise(dwelling_units = sum(dwelling_units),
+            cases = sum(cases)) %>%
+  mutate(dwelling_units_in_100 = dwelling_units/100,
+         filing_rate_per_100 = cases/dwelling_units_in_100,
+         monthly_filing_rate_per_100 = filing_rate_per_100/52)
+
+```
+
+
+# FACT CHECK
+
+It’s eviction day: the culmination of a monthly cycle of anxiety for many tenants of the sprawling 954-unit brick apartment complex — a hotbed of Maryland’s eviction crisis.
+
+```{r}
+
+webb_filings_by_parcel_over_time %>%
+  select(asst_first_owner, dwelling_units) %>%
+  unique() %>%
+  adorn_totals("row") %>%
+  as.data.frame()
+
+```
+
+"The Forest has filed at least 6,344 eviction cases in the past 52 months, likely an undercount because dismissed cases don’t get entered into case search."
+
+```{r}
+
+sum(webb_filings_by_parcel_over_time$cases)
+
+```
+
+"Yet records show Hendersen-Webb has filed at least six evictions for each unit at The Forest since 2019, according to a Baltimore Banner analysis of electronically available failure-to-pay-rent cases."
+
+```{r}
+
+sum(webb_filings_by_parcel_over_time$cases)/954
+
+```
+
+"One in three evictions at all large multifamily apartment complexes in the county takes place in the 1.5 square miles of monotonous apartment complexes around the University of Maryland Medical Center where The Forest is located, according to the Banner analysis."
+
+```{r}
+
+filings_by_parcel_by_tract %>%
+  st_drop_geometry() %>%
+  mutate(the_forest = case_when(
+    geoid20 %in% the_forest ~ "the forest",
+    TRUE ~ "all others")) %>%
+  group_by(the_forest) %>%
+  summarise(cases = sum(cases)) %>%
+  mutate(percent = (cases/sum(cases))*100)
+
+```
+
+```{r}
+
+filings_by_parcel_by_tract %>%
+  st_drop_geometry() %>%
+  filter(geoid20 %in% the_forest) %>%
+  distinct(geoid20, tract_area) %>%
+  select(geoid20, tract_area) %>%
+  adorn_totals("row") %>%
+  as.data.frame() %>%
+  mutate(tract_area_in_miles = tract_area * 3.86102e-7)
+
+```
+
+"The three complexes that make up The Forest have three of the four highest eviction filings rates in the county. On average, Hendersen-Webb files evictions for 13% of its units each month."
+
+```{r}
+
+filings_by_parcel
+
+```
+
+"Before the pandemic upended business as usual, it filed against 28% of its units each month."
+
+```{r}
+
+
+
+filings_by_parcel_over_time %>%
+  filter(str_detect(madr_line_1, "webb")) %>%
+  filter(year == 2019) %>%
+  group_by(year) %>%
+  summarise(cases = sum(cases),
+            dwelling_units = sum(dwelling_units)) %>%
+  mutate(cases_per_100_units = (cases/dwelling_units)*100) %>%
+  mutate(asst_first_owner = "The Forest")
+
+
+
+```
+
+
+"The population includes a high number of single mothers and Black women, who are caught at the breaking point of the affordability crisis: The lowest prices in the county are still out of reach."
+
+```{r}
+
+# Define variable codes
+variables <- c(
+  "B01003_001",
+  "B03002_001", "B03002_003", "B03002_004", "B03002_005", "B03002_006",
+  "B03002_007", "B03002_008", "B03002_009", "B01001_003", "B01002_001",
+  "B19013_001", "B17001_001", "B17001_002", "B15003_002", "B15003_016",
+  "B15003_018", "B15003_019", "B15003_020", "B15003_021", "B15003_022",
+  "B25001_001", "B25003_002", "B25003_003", "B25064_001", "B11005_002",
+  "B11001_003", "B11001_007", "B23025_001", "B23025_002", "B23025_005",
+  "B08301_003", "B08301_004", "B08301_010", "B08301_019", "B08301_021", 
+  "B11005_001", "B11005_004", "B11005_006", "B11005_007"
+  #"B08301_023"
+)
+
+acs_vars <- load_variables(2021, "acs5", cache = TRUE)
+
+filtered_acs_vars <- acs_vars %>%
+  filter(name %in% variables) %>%
+  mutate(label = case_when(
+    label == "Estimate!!Total" ~ paste0(label, "_", concept),
+    label == "Estimate!!Total:" ~ paste0(label, "_", concept),
+    TRUE ~ label
+  ))
+
+# Retrieve ACS data
+acs_data <- get_acs(geography = "tract", # Change the geography as needed
+                    variables = variables,
+                    year = 2021,
+                    state = "MD",
+                    county = "Anne Arundel",
+                    survey = "acs5")
+
+rename_vector <- setNames(filtered_acs_vars$name, 
+                          str_replace_all(filtered_acs_vars$label, " ", "_"))
+
+# Rename the columns in acs_data
+acs_data <- acs_data %>%
+  select(-moe) %>%
+  pivot_wider(values_from = estimate, names_from = variable)
+
+acs_data <- rename(acs_data, 
+                   !!rename_vector) %>%
+  clean_names()
+
+
+acs_data <- acs_data %>% 
+  mutate(
+    percent_white = (estimate_total_not_hispanic_or_latino_white_alone/estimate_total_total_population)*100,
+    percent_black = (estimate_total_not_hispanic_or_latino_black_or_african_american_alone/estimate_total_total_population)*100,
+    percent_american_indian = (estimate_total_not_hispanic_or_latino_american_indian_and_alaska_native_alone/estimate_total_total_population)*100,
+    percent_asian = (estimate_total_not_hispanic_or_latino_asian_alone/estimate_total_total_population)*100,
+    percent_native_hawaiian = (estimate_total_not_hispanic_or_latino_native_hawaiian_and_other_pacific_islander_alone/estimate_total_total_population)*100,
+    percent_other_race = (estimate_total_not_hispanic_or_latino_some_other_race_alone/estimate_total_total_population)*100,
+    percent_two_or_more_races = (estimate_total_not_hispanic_or_latino_two_or_more_races/estimate_total_total_population)*100,
+    percent_single_mothers = (estimate_total_households_with_one_or_more_people_under_18_years_family_households_other_family_female_householder_no_spouse_present/estimate_total_households_by_presence_of_people_under_18_years_by_household_type)*100,
+  ) %>%
+  left_join(filings_by_tract %>%
+              st_drop_geometry() %>%
+              rename(geoid = geoid20) %>%
+              select(geoid, cases, monthly_filing_rate_per_100))
+
+acs_data[is.na(acs_data)] <- 0
+
+library(corrr)
+
+correlated_acs_data <- correlate(
+  acs_data %>%
+    select(-geoid, -name)) %>%
+  select(term, cases, monthly_filing_rate_per_100) %>%
+  arrange(desc(cases))
+
+correlated_acs_data
+```
+
+```{r}
+
+acs_data %>%
+  mutate(in_forest = case_when(
+    geoid %in% the_forest ~ TRUE,
+    TRUE ~ FALSE
+  )) %>%
+  select(in_forest, percent_single_mothers) %>%
+  arrange(desc(percent_single_mothers)) 
+
+```
+
+"Evictions happen most often in parts of the county where a larger share of the population is Black and a larger share of households with children are led by a single female. About 40% of the population here is Black, more than twice the county average. The percent of households with children led by a single female is nearly four times higher."
+
+```{r}
+
+acs_data %>%
+  mutate(in_forest = case_when(
+    geoid %in% the_forest ~ TRUE,
+    TRUE ~ FALSE
+  )) %>%
+  group_by(in_forest) %>%
+  summarise(single_mother_households = sum(estimate_total_households_with_one_or_more_people_under_18_years_family_households_other_family_female_householder_no_spouse_present),
+            total_households_with_children = sum(estimate_total_households_by_presence_of_people_under_18_years_by_household_type)) %>%
+  mutate(percent_single_mother_households = (single_mother_households/total_households_with_children)*100)
+
+```
+
+```{r}
+
+acs_data %>%
+  mutate(temp = "temp") %>%
+  group_by(temp) %>%
+  summarise(single_mother_households = sum(estimate_total_households_with_one_or_more_people_under_18_years_family_households_other_family_female_householder_no_spouse_present),
+            total_households_with_children = sum(estimate_total_households_by_presence_of_people_under_18_years_by_household_type)) %>%
+  mutate(percent_single_mother_households = (single_mother_households/total_households_with_children)*100)
+
+```
+
+```{r}
+
+acs_data %>%
+  mutate(in_forest = case_when(
+    geoid %in% the_forest ~ TRUE,
+    TRUE ~ FALSE
+  )) %>%
+  group_by(in_forest) %>%
+  summarise(black_pop_non_hisp = sum(estimate_total_not_hispanic_or_latino_black_or_african_american_alone),
+            total_pop = sum(estimate_total_total_population)) %>%
+  mutate(percent_black = (black_pop_non_hisp/total_pop)*100)
+
+```
+
+```{r}
+
+
+acs_data %>%
+  mutate(temp = "temp") %>%
+  group_by(temp) %>%
+  summarise(black_pop_non_hisp = sum(estimate_total_not_hispanic_or_latino_black_or_african_american_alone),
+            total_pop = sum(estimate_total_total_population)) %>%
+  mutate(percent_black = (black_pop_non_hisp/total_pop)*100)
+  
+```
+
+"Since then, failure-to-pay-rent cases are on the rise. They make up 61% of cases filed since."
+
+```{r}
+
+temp <- read_csv("data/case-dbs/anne-arundel-2022.csv") %>%
+  bind_rows(read_csv("data/case-dbs/anne-arundel-2023-feb-thru-april.csv")) %>%
+  bind_rows(read_csv("data/case-dbs/january-test-case-db.csv"))
+
+temp %>%
+  mutate(filing_date = mdy(filing_date)) %>%
+  filter(filing_date > mdy("8/31/22")) %>%
+  group_by(case_type) %>%
+  summarise(filings = n()) %>%
+  mutate(percent = (filings/sum(filings))*100) %>%
+  arrange(desc(percent))
+
+```
+
+"Hendersen-Webb has played a large part in that increase, but evictions are increasing at many of the county’s large multifamily parcels. Filings are up year-over-year in 56% of Anne Arundel apartment complexes."
+
+```{r}
+
+temp <- filings_by_parcel_over_time %>%
+  ungroup() %>%
+  #select(asst_first_owner, dwelling_units, viz_date, dwelling_units, cases) %>%
+  group_by(asst_first_owner, dwelling_units, year) %>%
+  summarise(cases = sum(cases)) %>%
+  pivot_wider(values_from = cases, names_from = year) 
+
+temp[is.na(temp)] <- 0
+
+temp %>%
+  filter(dwelling_units > 10) %>%
+  clean_names() %>%
+  select(asst_first_owner, x2021, x2022) %>%
+  mutate(filings_up = case_when(
+    x2022 > x2021 ~ TRUE,
+    TRUE ~ FALSE
+  )) %>%
+  group_by(filings_up) %>%
+  count() %>%
+  ungroup() %>%
+  mutate(percent = (n/sum(n))*100)
+```
+
+"This has meant that, since the pandemic first dropped quarterly filings to practically zero, sharp increases have generally fallen in subsequent quarters."
+
+```{r}
+
+
+t <-  filings_by_parcel %>% 
+  group_by(year, month, asst_first_owner, dwelling_units, parcel_area, madr_line_1) %>%
+  summarise(cases = sum(cases)) %>%
+  st_drop_geometry() %>%
+  pivot_wider(values_from = cases, names_from = c(year, month)) %>%
+  clean_names()
+
+t[is.na(t)] <- 0
+
+t <- t %>%
+  mutate(asst_first_owner = str_to_title(asst_first_owner)) %>%  
+  mutate(across(starts_with("x"), ~ . / dwelling_units, .names = "evictions_per_unit_{col}")) %>%
+  filter(dwelling_units > 10) %>%
+  rename(complex = asst_first_owner) %>%
+  mutate(hendersen_webb = str_detect(madr_line_1, "c/o hend")) %>%
+  select(-starts_with("x")) %>%
+  rename_with(~gsub("evictions_per_unit_x", "", .), contains("evictions_per_unit_x"))
+
+t <- t %>%
+  left_join(t %>%
+              ungroup() %>%
+              select(-c(dwelling_units, parcel_area)) %>%
+              adorn_totals("col") %>%
+              as.data.frame() %>%
+              select(complex, madr_line_1 ,Total))
+
+t %>%
+  ungroup() %>%
+  mutate(average_monthly_filing_rate_per_100 = (Total/52)*100) %>%
+  relocate(complex, dwelling_units, average_monthly_filing_rate_per_100) %>%
+  select(hendersen_webb, complex, average_monthly_filing_rate_per_100) %>%
+  arrange(desc(average_monthly_filing_rate_per_100))
+
+```
+
+"But now, with federal funding having all but run out and only a minimal line for rental assistance in the state budget, the number of filings in the first quarter of 2023 has surpassed all other quarters since the pandemic began."
+
+```{r}
+
+filings_over_time <- filings %>%
+  st_drop_geometry() %>%
+  group_by(year, month) %>%
+  summarise(filings = sum(cases)) %>%
+  ungroup() %>%
+  mutate(quarter = case_when(
+    month %in% c(1,2,3) ~ 1,
+    month %in% c(4,5,6) ~ 2,
+    month %in% c(7,8,9) ~ 3,
+    month %in% c(10,11,12) ~ 4,
+  )) %>%
+  mutate(viz_date = paste0(year, "-Q", quarter)) %>%
+  group_by(viz_date) %>%
+  summarise(filings = sum(filings))
+
+filings_over_time %>%
+  filter(!str_detect(viz_date, "2019|2020-Q1")) %>%
+  arrange(desc(filings))
+
+```
+
+
+########### 
+
+# VIZ BUILDING
+
+```{r}
+
+all_other_parcels_filings_by_parcel_by_quarter <- filings_by_parcel_over_time %>%
+  filter(!str_detect(madr_line_1, "webb")) %>%
+  ungroup() %>%
+  mutate(quarter = case_when(
+    month %in% c(1, 2, 3) ~ 1,
+    month %in% c(4, 5, 6) ~ 2,
+    month %in% c(7, 8, 9) ~ 3,
+    month %in% c(10, 11, 12) ~ 4
+  )) %>%
+  #mutate(viz_date = mdy(paste0(quarter, "/1/", year))) %>%
+  mutate(viz_date = paste0(year, "-Q", quarter)) %>%
+  group_by(viz_date) %>%
+  summarise(dwelling_units = sum(dwelling_units),
+            cases = sum(cases)) %>%
+  mutate(cases_per_100_units = (cases/dwelling_units)*100) %>%
+  mutate(asst_first_owner = "all other parcels") %>%
+  arrange(asst_first_owner, viz_date)
+
+
+viz_webb_and_all_parcels_filings_by_parcel_over_time <- filings_by_parcel_over_time %>%
+  filter(str_detect(madr_line_1, "webb")) %>%
+  ungroup() %>%
+  mutate(quarter = case_when(
+    month %in% c(1, 2, 3) ~ 1,
+    month %in% c(4, 5, 6) ~ 2,
+    month %in% c(7, 8, 9) ~ 3,
+    month %in% c(10, 11, 12) ~ 4
+  )) %>%
+  mutate(viz_date = paste0(year, "-Q", quarter)) %>%
+  group_by(viz_date) %>%
+  summarise(cases = sum(cases),
+            dwelling_units = sum(dwelling_units)) %>%
+  mutate(cases_per_100_units = (cases/dwelling_units)*100) %>%
+  mutate(asst_first_owner = "The Forest") %>%
+  bind_rows(all_other_parcels_filings_by_parcel_by_quarter) %>%
+  ungroup() %>%
+  select(-cases, -dwelling_units) %>%
+  pivot_wider(names_from = asst_first_owner, values_from = cases_per_100_units)
+
+viz_webb_and_all_parcels_filings_by_parcel_over_time[is.na(viz_webb_and_all_parcels_filings_by_parcel_over_time)] <- 0
+
+write_csv(viz_webb_and_all_parcels_filings_by_parcel_over_time, "data/output/viz/webb_and_all_parcels_filings_by_parcel_over_time.csv")
+  
+```
+
+## THE FOREST TRACKS VIZ
+
+```{r}
+
+the_forest_for_viz <- sf_parcels_by_filings %>%
+  #filter(!str_detect(madr_line_1, "c/o hend")) %>%
+  st_intersection(the_forest_tracts %>%
+                    mutate(temp = "temp") %>% 
+                    group_by(temp) %>%
+                    summarise(geometry = st_union(geometry))) %>%
+  mutate(hendersen_webb = str_detect(madr_line_1, "c/o hend")) %>%
+  filter(dwelling_units > 0) %>%
+  distinct(asst_first_owner, .keep_all = TRUE) %>%
+  mutate(asst_first_owner = str_to_title(asst_first_owner))
+
+the_forest_for_viz[is.na(the_forest_for_viz)] <- 0
+
+centroids <- st_centroid(the_forest_for_viz)
+
+# Extract the latitudes and longitudes
+the_forest_for_viz$lats <- st_coordinates(centroids)[,2]
+the_forest_for_viz$longs <- st_coordinates(centroids)[,1]
+
+write_sf(the_forest_for_viz, "data/output/viz/the_forest_for_viz.geojson")
+
+#write_sf(non_highlighted_for_viz, "data/output/non_highlighted_for_viz.geojson")
+
+mapview(the_forest_for_viz)
+
+```
+
+```{r}
+
+temp <- the_forest_for_viz %>%
+  mutate(temp = "temp") %>%
+  group_by(temp) %>%
+  summarise(geometry = st_union(geometry))
+
+options(digits = 10)
+
+st_coordinates(st_centroid(temp))
+
+the_forest_for_viz$longs[3]
+
+write_sf(tracts, "data/output/viz/tracts-no-water.geojson")
+
+```
+
+```{r}
+
+mapview(sf_parcels_by_filings)
+
+simplified_sf_parcels_by_filings <- st_simplify(sf_parcels_by_filings, dTolerance = 0.001)
+
+mapview(simplified_sf_parcels_by_filings)
+
+write_sf(simplified_sf_parcels_by_filings, "data/output/viz/simplified_sf_parcels_by_filings.geojson")
+
+```
+
+## HOSPITAL SHAPEFILE
+
+```{r}
+
+t_parcels <- read_sf("data/shapes/Parcels.geojson") %>%
+  #cleaning up text
+  clean_names() %>%
+  lower_df() %>%
+  st_make_valid()
+
+t_intersection<- st_intersection(t_parcels, the_forest_tracts)
+
+t <- t_intersection %>%
+  filter(str_detect(asst_first_owner, "north arundel hosp assoc inc")) %>%
+  st_simplify(dTolerance = 0.0001)
+
+write_sf(t, "data/output/viz/hospital.geojson")
+```
+
+## REMOVALS BY TRACT
+
+```{r}
+
+removals <- read_xlsx("data/evictions PIA.xlsx") %>%
+  bind_rows(read_xlsx("data/2022-05-01 to 2022-09-19 CAD CALLS - Nature Code 40X Evictions (1).xlsx")) %>%
+  clean_names() %>%
+  lower_df() %>%
+  st_as_sf(coords = c("longitude", "latitude"),
+           crs = 4326)
+
+
+
+removals_by_tracts <- st_intersection(removals, parcels_by_tract %>%
+  group_by(geoid20) %>%
+  summarise(dwelling_units = sum(dwelling_units)))
+
+t <- removals_by_tracts %>%
+  as.data.frame() %>%
+  group_by(geoid20, dwelling_units) %>%
+  count() %>%
+  arrange(desc(n)) %>%
+  mutate(units_in_100 = dwelling_units/100,
+         removals_per_100_units = n/units_in_100) %>%
+  #filter(dwelling_units > 10) %>%
+  arrange(desc(removals_per_100_units)) %>%
+  rename(removals = n)
+
+write_csv(t, "data/output/viz/removals-per-unit.csv")
+
+
+forest = 25+22+42+32+32
+
+forest/nrow(removals)
+```
+
+## FILINGS OVER TIME
+
+```{r}
+
+filings_over_time <- filings %>%
+  st_drop_geometry() %>%
+  group_by(year, month) %>%
+  summarise(filings = sum(cases)) %>%
+  ungroup() %>%
+  mutate(quarter = case_when(
+    month %in% c(1,2,3) ~ 1,
+    month %in% c(4,5,6) ~ 2,
+    month %in% c(7,8,9) ~ 3,
+    month %in% c(10,11,12) ~ 4,
+  )) %>%
+  mutate(viz_date = paste0(year, "-Q", quarter)) %>%
+  group_by(viz_date) %>%
+  summarise(filings = sum(filings))
+  #mutate(viz_date = mdy(paste0(month,"/1/", year)))
+
+write_csv(filings_over_time, "data/output/viz/filings-over-time.csv")
+
+```
+
+## PARCELS BY CHANGE OVER TIME
+
+```{r}
+
+t <-  filings_by_parcel %>% 
+  group_by(year, month, asst_first_owner, dwelling_units, parcel_area, madr_line_1) %>%
+  summarise(cases = sum(cases)) %>%
+  st_drop_geometry() %>%
+  pivot_wider(values_from = cases, names_from = c(year, month)) %>%
+  clean_names()
+
+t[is.na(t)] <- 0
+
+t <- t %>%
+  mutate(asst_first_owner = str_to_title(asst_first_owner)) %>%  
+  mutate(across(starts_with("x"), ~ . / dwelling_units, .names = "evictions_per_unit_{col}")) %>%
+  filter(dwelling_units > 10) %>%
+  rename(complex = asst_first_owner) %>%
+  mutate(hendersen_webb = str_detect(madr_line_1, "c/o hend")) %>%
+  select(-starts_with("x")) %>%
+  rename_with(~gsub("evictions_per_unit_x", "", .), contains("evictions_per_unit_x"))
+
+t <- t %>%
+  left_join(t %>%
+              ungroup() %>%
+              select(-c(dwelling_units, parcel_area)) %>%
+              adorn_totals("col") %>%
+              as.data.frame() %>%
+              select(complex, madr_line_1 ,Total))
+
+t <- t %>%
+  ungroup() %>%
+  mutate(average_monthly_filing_rate_per_100 = (Total/52)*100) %>%
+  relocate(complex, dwelling_units, average_monthly_filing_rate_per_100)
+
+write_csv(t, "data/output/viz/parcel-table-filing-rates.csv")
+
+```
